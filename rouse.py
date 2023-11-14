@@ -13,6 +13,17 @@ Model
 import numpy as np
 import scipy.linalg
 import scipy.special
+import tensorflow as tf
+
+@tf.function(reduce_retracing=True)
+def tf_eigh(A_tf):
+    return tf.linalg.eigh(A_tf)
+@tf.function
+def prop_M_mult(B,M,G):
+    B @ M + G
+@tf.function
+def prop_C_mult(B,C,Sig):
+    return B @ C @ B + Sig
 
 class Model:
     r"""
@@ -57,6 +68,7 @@ class Model:
     F : (N, d) array, dtype=float, internal
         deterministic external force on each monomer. Zero by default
 
+
     Other Parameters
     ----------------
     setup_dynamics : bool
@@ -66,6 +78,8 @@ class Model:
         shortcut for adding bonds to the system before initializing dynamics.
         Corresponds to the `!links` argument of `add_bonds`, see there for
         more details.
+    use_tf : bool
+
     """
     # Implementation notes
     # --------------------
@@ -85,7 +99,7 @@ class Model:
     # Since A is singular in many use cases, getting the numerics straight
     # requires some thought. Also some conceptual points such as "what's the
     # right steady state?" might become somewhat tricky.
-    # 
+    #
     # The numerical issue is actually not limiting in our case: A is always
     # real & symmetric, thus orthogonally diagonalizable, which eliminates
     # numerical issues with the eigendecomposition (Moler & van Loan, 1978: "19
@@ -113,13 +127,22 @@ class Model:
     #   Thus, if we multiply V.D.VT.F with V: (N, N), D: diagonal(d), F: (N, 3)
     #   we should write V @ (d[:, None] * (V @ F)). Thus we never actually
     #   execute an (N, N) x (N, N) multiplication
-    
-    def __init__(self, N, D=1., k=1., d=3, setup_dynamics=True, add_bonds=None):
+
+    def __init__(
+        self, N, D=1.0, k=1.0, d=3, setup_dynamics=True, add_bonds=None, use_tf=(False,None)
+    ):
         self.N = N
         self.D = D
         self.k = k
+        if self.k <= 0:
+            raise ValueError("k must be > 0")
 
-        self._dynamics = {'needs_updating' : True}
+        self._dynamics = {"needs_updating": True}
+        self.use_tf = use_tf
+        if use_tf[0]:
+            gpus = tf.config.list_physical_devices('GPU')
+            tf.config.set_visible_devices(gpus[use_tf[1]], 'GPU')
+            tf.experimental.numpy.experimental_enable_numpy_behavior()
 
         self.setup_free_chain(d)
         if add_bonds is not None:
@@ -133,22 +156,24 @@ class Model:
         return self.F.shape[1]
 
     def __eq__(self, other):
-        for param in ['N', 'D', 'k']:
+        for param in ["N", "D", "k"]:
             if getattr(self, param) != getattr(other, param):
                 return False
-        for param in ['A', 'F']:
+        for param in ["A", "F"]:
             if np.any(getattr(self, param) != getattr(other, param)):
                 return False
         return True
 
     def __repr__(self):
         n_extra_bonds = np.count_nonzero(np.triu(self.A, k=2).flatten())
-        rep = "rouse.Model(N={}, D={}, k={}, d={})".format(self.N, self.D, self.k, self.d)
+        rep = "rouse.Model(N={}, D={}, k={}, d={})".format(
+            self.N, self.D, self.k, self.d
+        )
         if n_extra_bonds > 0:
             rep += " with {} additional bonds".format(n_extra_bonds)
         return rep
 
-####### Setting up a model and its dynamics (mostly for internal use)
+    ####### Setting up a model and its dynamics (mostly for internal use)
 
     def setup_free_chain(self, d=3):
         """
@@ -165,19 +190,21 @@ class Model:
         --------
         add_bonds, add_tether
         """
-        self._dynamics['needs_updating'] = True
+        self._dynamics["needs_updating"] = True
 
         if self.N == 1:
             self.A = np.zeros((1, 1), dtype=float)
         else:
-            self.A = np.diagflat(self.N*[2.], k=0) \
-                     + np.diagflat((self.N-1)*[-1.], k=-1) \
-                     + np.diagflat((self.N-1)*[-1.], k= 1)
+            self.A = (
+                np.diagflat(self.N * [2.0], k=0)
+                + np.diagflat((self.N - 1) * [-1.0], k=-1)
+                + np.diagflat((self.N - 1) * [-1.0], k=1)
+            )
             self.A[0, 0] = self.A[-1, -1] = 1
-        
+
         self.F = np.zeros((self.N, d))
 
-    def add_bonds(self, links, k_rel=1.):
+    def add_bonds(self, links, k_rel=1.0):
         """
         Add additional bonds to connectivity matrix
 
@@ -195,7 +222,7 @@ class Model:
         --------
         add_tether
         """
-        self._dynamics['needs_updating'] = True
+        self._dynamics["needs_updating"] = True
 
         for link in links:
             myk_rel = k_rel if len(link) == 2 else link[2]
@@ -204,7 +231,7 @@ class Model:
             self.A[link[1], link[0]] -= myk_rel
             self.A[link[1], link[1]] += myk_rel
 
-    def add_tether(self, mon=0, k_rel=1., point=None):
+    def add_tether(self, mon=0, k_rel=1.0, point=None):
         """
         Tether a monomer to a fixed point in space
 
@@ -230,12 +257,12 @@ class Model:
         else:
             point = np.asarray(point)
 
-        self._dynamics['needs_updating'] = True
-        
+        self._dynamics["needs_updating"] = True
+
         self.A[mon, mon] += k_rel
         self.F[mon] += self.k * k_rel * point
 
-    def update_dynamics(self, dt=1.):
+    def update_dynamics(self, dt=1.0):
         """
         Pre-calculate dynamic matrices
 
@@ -261,26 +288,36 @@ class Model:
         check_dynamics
         """
         # Eigendecomposition of A
-        w, V = scipy.linalg.eigh(self.A)
-        w[np.abs(w) < 1e-10] = 0
+        
+        if self.use_tf[0] and len(self.A)<=10000:
+            w, V = tf_eigh(tf.convert_to_tensor(self.A))#tf.linalg.eigh(self.A)
+            w = tf.nn.relu(w-1e-10)
+        else:
+            w, V = scipy.linalg.eigh(self.A)
+            w[np.abs(w) < 1e-10] = 0
+            if self.use_tf[0]:
+                w = tf.convert_to_tensor(w)
+                V = tf.convert_to_tensor(V)
 
         mp_kw = np.zeros_like(w)
-        mp_kw[w != 0] = 1 / (self.k*w[w!=0])
+        mp_kw[w != 0] = 1 / (self.k * w[w != 0])
 
         # Steady state covariance = Moore-Penrose inverse
         ss_CoD = V @ (mp_kw[:, None] * V.T)
-        
+
         # Propagator (simply exp(-k*A*Δt)
-        B = V @ (np.exp(-self.k*w*dt)[:, None] * V.T)
+        B = V @ (np.exp(-self.k * w * dt)[:, None] * V.T)
 
         # Integrated exponentials with proper handling of singular eigenvalues
         exp_w_1 = np.zeros_like(w)
-        exp_w_1[w != 0] = (1-np.exp(-self.k*w[w!=0]*dt)) / (self.k*w[w!=0])
+        exp_w_1[w != 0] = (1 - np.exp(-self.k * w[w != 0] * dt)) / (self.k * w[w != 0])
         exp_w_1[w == 0] = dt
 
         exp_w_2 = np.zeros_like(w)
-        exp_w_2[w != 0] = (1-np.exp(-2*self.k*w[w!=0]*dt)) / (self.k*w[w!=0])
-        exp_w_2[w == 0] = 2*dt
+        exp_w_2[w != 0] = (1 - np.exp(-2 * self.k * w[w != 0] * dt)) / (
+            self.k * w[w != 0]
+        )
+        exp_w_2[w == 0] = 2 * dt
 
         # discrete noise correlation matrix Σ and its Cholesky decomposition
         if self.D > 0:
@@ -291,21 +328,30 @@ class Model:
             LSig = np.zeros((self.N, self.N))
 
         self._dynamics = {
-                'needs_updating' : False,
-                'N'              : self.N,
-                'D'              : self.D,
-                'k'              : self.k,
-                'dt'             : dt,
-                'w'              : w,
-                'mp_kw'          : mp_kw,
-                'V'              : V,
-                'B'              : B,
-                'ss_CoD'         : ss_CoD,
-                'exp_w_1'        : exp_w_1,
-                'Sig'            : Sig,
-                'LSig'           : LSig,
+            "needs_updating": False,
+            "N": self.N,
+            "D": self.D,
+            "k": self.k,
+            "dt": dt,
+            "w": w,
+            "mp_kw": mp_kw,
+            "V": V,
+            "B": B,
+            "ss_CoD": ss_CoD,
+            "exp_w_1": exp_w_1,
+            "Sig": Sig,
+            "LSig": LSig,
         }
         self.update_F_only()
+        if self.use_tf[0]:
+            # self._dynamics["B"] = tf.convert_to_tensor(self._dynamics["B"],dtype=tf.float32)
+            # self._dynamics["G"] = tf.convert_to_tensor(self._dynamics["G"],dtype=tf.float32)
+            # self._dynamics["Sig"] = tf.convert_to_tensor(self._dynamics["Sig"],dtype=tf.float32)
+            self._dynamics["LSig"] = tf.convert_to_tensor(self._dynamics["LSig"],dtype=tf.float32)
+            # self._dynamics["ss_CoD"] = tf.convert_to_tensor(self._dynamics["ss_CoD"],dtype=tf.float32)
+            self._dynamics["mp_kw"] = tf.convert_to_tensor(self._dynamics["mp_kw"],dtype=tf.float32)
+            self._dynamics["exp_w_1"] = tf.convert_to_tensor(self._dynamics["exp_w_1"],dtype=tf.float32)
+            # self._dynamics["w"] = tf.convert_to_tensor(self._dynamics["w"],dtype=tf.float32)
 
     def update_F_only(self, override_full_update=False):
         """
@@ -322,17 +368,20 @@ class Model:
         update_dynamics
         """
         if not np.any(self.F):
-            G = np.zeros_like(self.F)
+            if self.use_tf[0]:
+                G = tf.zeros_like(self.F)
+            else:
+                G = np.zeros_like(self.F)
         else:
-            V = self._dynamics['V']
-            e = self._dynamics['exp_w_1']
+            V = self._dynamics["V"]
+            e = self._dynamics["exp_w_1"]
             G = V @ (e[:, None] * (V.T @ self.F))
-        
-        self._dynamics['G'] = G
-        self._dynamics['ss_M'] = self._dynamics['ss_CoD'] @ self.F
+
+        self._dynamics["G"] = G
+        self._dynamics["ss_M"] = self._dynamics["ss_CoD"] @ self.F
 
         if override_full_update:
-            self._dynamics['needs_updating'] = False
+            self._dynamics["needs_updating"] = False
 
     def check_dynamics(self, dt=None, run_if_necessary=True):
         """
@@ -360,27 +409,27 @@ class Model:
         """
         if dt is None:
             try:
-                dt = self._dynamics['dt']
+                dt = self._dynamics["dt"]
             except KeyError:
                 raise RuntimeError("Call update_dynamics before running")
 
         try:
-            if dt != self._dynamics['dt']:
-                self._dynamics['needs_updating'] = True
+            if dt != self._dynamics["dt"]:
+                self._dynamics["needs_updating"] = True
 
-            for key in ['N', 'D', 'k']:
+            for key in ["N", "D", "k"]:
                 if self._dynamics[key] != getattr(self, key):
-                    self._dynamics['needs_updating'] = True
+                    self._dynamics["needs_updating"] = True
         except KeyError:
-            self._dynamics['needs_updating'] = True
-        
-        if self._dynamics['needs_updating']:
+            self._dynamics["needs_updating"] = True
+
+        if self._dynamics["needs_updating"]:
             if run_if_necessary:
                 self.update_dynamics(dt)
             else:
                 raise RuntimeError("Model changed since last call to update_dynamics()")
 
-####### Propagation of an ensemble
+    ####### Propagation of an ensemble
 
     def steady_state(self):
         """
@@ -409,9 +458,11 @@ class Model:
         """
         try:
             self.check_dynamics(run_if_necessary=True)
-        except RuntimeError: # if the model is really not set up, it won't have a time step, so we have to do this by hand
+        except (
+            RuntimeError
+        ):  # if the model is really not set up, it won't have a time step, so we have to do this by hand
             self.update_dynamics()
-        return self._dynamics['ss_M'], self._dynamics['ss_CoD']*self.D
+        return self._dynamics["ss_M"], self._dynamics["ss_CoD"] * self.D
 
     def propagate_M(self, M, dt=None, check_dynamics=True):
         """
@@ -440,9 +491,12 @@ class Model:
         """
         if check_dynamics:
             self.check_dynamics(dt, run_if_necessary=True)
-        B = self._dynamics['B']
-        G = self._dynamics['G']
-        return B @ M + G
+        B = self._dynamics["B"]
+        G = self._dynamics["G"]
+        if self.use_tf[0]:
+            return prop_M_mult(B,M,G)
+        else:
+            return B @ M + G
 
     def propagate_C(self, C, dt=None, check_dynamics=True):
         """
@@ -471,9 +525,12 @@ class Model:
         """
         if check_dynamics:
             self.check_dynamics(dt, run_if_necessary=True)
-        B = self._dynamics['B']
-        Sig = self._dynamics['Sig']
-        return B @ C @ B + Sig
+        B = self._dynamics["B"]
+        Sig = self._dynamics["Sig"]
+        if self.use_tf[0]:
+            return prop_C_mult(B,C,B,Sig)
+        else:
+            return B @ C @ B + Sig
 
     def propagate(self, M, C, dt=None, check_dynamics=True):
         """
@@ -504,10 +561,11 @@ class Model:
         --------
         propagate_M, propagate_C, steady_state
         """
-        return self.propagate_M(M, dt, check_dynamics), \
-               self.propagate_C(C, dt, check_dynamics=False) # if needed, dynamics were already checked in M step
+        return self.propagate_M(M, dt, check_dynamics), self.propagate_C(
+            C, dt, check_dynamics=False
+        )  # if needed, dynamics were already checked in M step
 
-####### Evolution of a single conformation
+    ####### Evolution of a single conformation
 
     def conf_ss(self):
         """
@@ -525,9 +583,17 @@ class Model:
         M, _ = self.steady_state()
         # C as returned by steady_state() might be singular, so utilize
         # analytical √C directly
-        V = self._dynamics['V']
-        mp_Dkw = self.D * self._dynamics['mp_kw']
-        return M + V @ (np.sqrt(mp_Dkw)[:, None] * np.random.normal(size=(self.N, self.d)))
+        V = self._dynamics["V"]
+        mp_Dkw = self.D * self._dynamics["mp_kw"]
+        if self.use_tf[0]:
+            tf.sqrt(mp_Dkw)[:, None] * tf.random.normal(shape=(self.N, self.d))
+            return M + V @ (
+                tf.sqrt(mp_Dkw)[:, None] * tf.random.normal(shape=(self.N, self.d))
+            )
+        else:
+            return M + V @ (
+                np.sqrt(mp_Dkw)[:, None] * np.random.normal(size=(self.N, self.d))
+            )
 
     def evolve(self, conf, dt=None, check_dynamics=True):
         """
@@ -556,11 +622,14 @@ class Model:
         """
         if check_dynamics:
             self.check_dynamics(dt, run_if_necessary=True)
-        B = self._dynamics['B']
-        L = self._dynamics['LSig']
-        return B @ conf + L @ np.random.normal(size=conf.shape)
+        B = self._dynamics["B"]
+        L = self._dynamics["LSig"]
+        if self.use_tf[0]:
+            return B @ conf + L @ tf.random.normal(shape=conf.shape)
+        else:
+            return B @ conf + L @ np.random.normal(size=conf.shape)
 
-####### MSD and related stuff
+    ####### MSD and related stuff
 
     def MSD(self, dts, w=None):
         r"""
@@ -624,17 +693,17 @@ class Model:
         """
         dts = np.asarray(dts)
         if len(dts.shape) == 0:
-            dts = dts[None] # make 1D
+            dts = dts[None]  # make 1D
         if np.any(dts < 0):
             raise ValueError("dt should be >= 0")
 
         # Get pre-computed eigendecomposition
         # (Can't use `w` as eigenvalues, so those are `evs` now)
-        evs = self._dynamics['w']
+        evs = self._dynamics["w"]
         evs_z = evs == 0
         evs_nz = ~evs_z
 
-        V = self._dynamics['V']
+        V = self._dynamics["V"]
         Vout = V
         if w is not None:
             Vout = w @ V
@@ -643,28 +712,37 @@ class Model:
         # Check time steps
         dt_finite = np.isfinite(dts)
         if np.any(dts[~dt_finite] != np.inf):
-            raise ValueError(f"Invalid dt value(s): {dts[np.logical_and(~dt_finite, dts != np.inf)]}")
+            raise ValueError(
+                f"Invalid dt value(s): {dts[np.logical_and(~dt_finite, dts != np.inf)]}"
+            )
         if not np.all(dt_finite):
             if w is None:
                 if np.any(evs_z):
-                    raise ValueError("Cannot evaluate MSD(Δt = inf): System does not equilibrate")
+                    raise ValueError(
+                        "Cannot evaluate MSD(Δt = inf): System does not equilibrate"
+                    )
             else:
                 if np.any(Vout[..., evs_z] != 0):
-                    raise ValueError("Cannot evaluate MSD(Δt = inf): w@System@w does not equilibrate")
+                    raise ValueError(
+                        "Cannot evaluate MSD(Δt = inf): w@System@w does not equilibrate"
+                    )
 
         # Set up first part of the analytical expression
-        k_evs_nz = self.k*evs[evs_nz]
-        dDk_evs_nz = 2*self.d*self.D/k_evs_nz
+        k_evs_nz = self.k * evs[evs_nz]
+        dDk_evs_nz = 2 * self.d * self.D / k_evs_nz
 
         # Second part, applies only to singular degrees of freedom
-        VF = (V.T @ self.F)
-        VF[evs_nz, :] = 0 # action of S
+        VF = V.T @ self.F
+        VF[evs_nz, :] = 0  # action of S
         VSVF = Vout @ VF  # now (N, d) or (d,)
         Phi = VSVF @ VSVF.T
         if np.any(Phi):
+
             def add_Phi(VEV, dt):
-                return VEV + (dt*dt)*Phi
+                return VEV + (dt * dt) * Phi
+
         else:
+
             def add_Phi(VEV, dt):
                 return VEV
 
@@ -674,13 +752,13 @@ class Model:
         for dt, finite in zip(dts, dt_finite):
             E = np.empty(len(evs), dtype=float)
             if finite:
-                E[evs_nz] = (1-np.exp(-dt*k_evs_nz)) * dDk_evs_nz
-                E[evs_z ] = 2*self.d*self.D*dt
+                E[evs_nz] = (1 - np.exp(-dt * k_evs_nz)) * dDk_evs_nz
+                E[evs_z] = 2 * self.d * self.D * dt
             else:
                 # We checked before that in this case the evs == 0 dof are
                 # irrelevant anyways
                 E[evs_nz] = dDk_evs_nz
-                E[evs_z ] = 0
+                E[evs_z] = 0
 
             if len(Vout.shape) > 1:
                 out = Vout @ (E[:, None] * Vout.T)
@@ -729,21 +807,21 @@ class Model:
         """
         dts = np.asarray(dts)
         if len(dts.shape) == 0:
-            dts = dts[None] # make 1D
+            dts = dts[None]  # make 1D
         if np.any(dts < 0):
             raise ValueError("dt should be >= 0")
 
         # Get pre-computed eigendecomposition
         # (Can't use `w` as eigenvalues, so those are `evs` now)
-        evs = self._dynamics['w']
-        Vout = self._dynamics['V']
+        evs = self._dynamics["w"]
+        Vout = self._dynamics["V"]
         if w is not None:
             Vout = w @ Vout
 
         # calculating Bs for all dt
         def calc_B(dt):
             if np.isfinite(dt):
-                B = np.exp(-self.k*dt*evs)
+                B = np.exp(-self.k * dt * evs)
             elif dt == np.inf:
                 B = np.zeros_like(evs)
             else:
@@ -752,13 +830,15 @@ class Model:
             return B
 
         # assemble from steady state
-        mp_dDkw = (self.d * self.D) * self._dynamics['mp_kw']
+        mp_dDkw = (self.d * self.D) * self._dynamics["mp_kw"]
         if len(Vout.shape) > 1:
-            return np.array([Vout @ ((calc_B(dt)*mp_dDkw)[:, None] * Vout.T) for dt in dts])
+            return np.array(
+                [Vout @ ((calc_B(dt) * mp_dDkw)[:, None] * Vout.T) for dt in dts]
+            )
         else:
             return np.array([Vout @ (calc_B(dt) * mp_dDkw * Vout) for dt in dts])
 
-####### Length & Time scales
+    ####### Length & Time scales
 
     def timescales(self):
         """
@@ -773,20 +853,20 @@ class Model:
             Rouse to equilibrium of the end-to-end distance (for a free chain)
         """
         return {
-                't_microscopic' : 1/self.k,
-                't_Rouse' : (self.N / np.pi)**2 / self.k,                
-                't_equilibration' : np.pi*self.N**2 / (4*self.k),
-                }
+            "t_microscopic": 1 / self.k,
+            "t_Rouse": (self.N / np.pi) ** 2 / self.k,
+            "t_equilibration": np.pi * self.N**2 / (4 * self.k),
+        }
 
     def Gamma(self):
         """
         MSD prefactor of a single locus on the polymer
-        
+
         Returns
         -------
         float
         """
-        return 2*self.d*self.D / np.sqrt(np.pi*self.k)
+        return 2 * self.d * self.D / np.sqrt(np.pi * self.k)
 
     def rms_Ree(self, L=None):
         """
@@ -802,10 +882,10 @@ class Model:
         float
         """
         if L is None:
-            L = self.N-1
-        return np.sqrt(self.d*self.D/self.k * L)
+            L = self.N - 1
+        return np.sqrt(self.d * self.D / self.k * L)
 
-####### Auxiliary things
+    ####### Auxiliary things
 
     def contact_frequency(self):
         """
@@ -822,8 +902,9 @@ class Model:
         """
         _, J = self.steady_state()
         Jii = np.tile(np.diagonal(J), (len(J), 1))
-        with np.errstate(divide='ignore'): # the diagonal gives np.inf; that's fine
-            return (Jii + Jii.T - 2*J)**(-self.d/2)
+        with np.errstate(divide="ignore"):  # the diagonal gives np.inf; that's fine
+            return (Jii + Jii.T - 2 * J) ** (-self.d / 2)
+
 
 def twoLocusMSD(dts, Gamma, J):
     r"""
@@ -864,11 +945,12 @@ def twoLocusMSD(dts, Gamma, J):
     if np.any(ind_invalid):
         raise ValueError(f"dts contain invalid values: {dts[ind_invalid]}")
 
-    tau = (J / Gamma)**2 / np.pi
+    tau = (J / Gamma) ** 2 / np.pi
     ret = np.empty(dts.shape, dtype=float)
-    ret[ind_zero]   = 0
-    with np.errstate(under='ignore'):
-        ret[ind_finite] = 2*Gamma * np.sqrt(dts[ind_finite]) * (1 - np.exp(-tau/dts[ind_finite])) \
-                            + 2*J * scipy.special.erfc( np.sqrt(tau/dts[ind_finite]) )
-    ret[ind_inf]    = 2*J
+    ret[ind_zero] = 0
+    with np.errstate(under="ignore"):
+        ret[ind_finite] = 2 * Gamma * np.sqrt(dts[ind_finite]) * (
+            1 - np.exp(-tau / dts[ind_finite])
+        ) + 2 * J * scipy.special.erfc(np.sqrt(tau / dts[ind_finite]))
+    ret[ind_inf] = 2 * J
     return ret
